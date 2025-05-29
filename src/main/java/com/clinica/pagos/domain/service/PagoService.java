@@ -12,7 +12,7 @@ import com.clinica.pagos.domain.repository.IPago;
 import com.clinica.pagos.infrastructure.client.CitaClient;
 import com.clinica.pagos.infrastructure.client.NotificacionesFeignClient;
 import com.clinica.pagos.infrastructure.client.dto.CitaDTO;
-import com.clinica.pagos.infrastructure.client.dto.NotificacionDTO; // ¡Correcto! Ahora es singular
+import com.clinica.pagos.infrastructure.client.dto.NotificacionDTO;
 
 import feign.FeignException;
 
@@ -60,77 +60,50 @@ public class PagoService {
         }
 
         if (dto.getEstado() == null) {
-            dto.setEstado("COMPLETADO");
+            dto.setEstado("PENDIENTE"); // Establece un estado inicial por defecto si no viene
         }
 
+        // No hay estado previo al guardar, así que solo usamos el estado actual
         PagoDTO pagoGuardado = repo.save(dto);
         enriquecerPago(pagoGuardado);
 
-        System.out.println("DEBUG: Estado del pago guardado: " + pagoGuardado.getEstado());
+        // Intenta enviar notificación si el estado es COMPLETADO después de guardar
         if ("COMPLETADO".equals(pagoGuardado.getEstado())) {
-            System.out.println("DEBUG: El pago está COMPLETADO, intentando enviar notificación.");
-            try {
-                String asunto = "Confirmación de Pago Completado para su Cita";
-                String mensaje = String.format("Estimado(a) %s,\n\nSu pago de %.2f USD para la cita con el Dr. %s ha sido completado exitosamente.\n\nReferencia de pago: %s",
-                                                cita.getNombrePaciente(), pagoGuardado.getMonto(), cita.getNombreMedico(), pagoGuardado.getReferencia());
-
-                // ¡Aquí está la llamada al constructor que te daba error!
-                // Es correcta y coincide con el constructor de 6 parámetros en tu NotificacionDTO del lado de Pagos.
-                NotificacionDTO notificacion = new NotificacionDTO(
-                    cita.getPacienteId(),
-                    "PAGO_COMPLETADO",
-                    asunto,
-                    mensaje,
-                    "EMAIL",
-                    "PagoService:" + pagoGuardado.getId()
-                );
-
-                notificacionesFeignClient.enviarNotificacion(notificacion);
-                System.out.println("DEBUG: Notificación de pago enviada exitosamente a NotificacionesService.");
-            } catch (FeignException e) {
-                System.err.println("ERROR Feign al enviar notificación de pago completado: " + e.status() + " - " + e.getMessage());
-                e.printStackTrace();
-            } catch (Exception e) {
-                System.err.println("ERROR GENERAL al intentar enviar notificación de pago completado: " + e.getMessage());
-                e.printStackTrace();
-            }
-        } else {
-            System.out.println("DEBUG: El estado del pago no es COMPLETADO, no se envía notificación.");
+            enviarNotificacionPago(pagoGuardado, "COMPLETADO", cita);
         }
 
         return pagoGuardado;
     }
 
     public PagoDTO actualizar(Long id, PagoDTO dto) {
+        // 1. Obtener el estado actual del pago antes de la actualización
+        Optional<PagoDTO> pagoPrevioOpt = repo.getById(id);
+        String estadoPrevio = pagoPrevioOpt.map(PagoDTO::getEstado).orElse(null);
+
         PagoDTO pagoActualizado = repo.update(id, dto);
+
         if (pagoActualizado != null) {
             enriquecerPago(pagoActualizado);
 
-            if ("ANULADO".equals(pagoActualizado.getEstado())) {
-                System.out.println("DEBUG: El pago está ANULADO, intentando enviar notificación.");
-                try {
-                    CitaDTO cita = citaClient.getCitaById(pagoActualizado.getCitaId());
-                    String asunto = "Notificación de Pago Anulado";
-                    String mensaje = String.format("Estimado(a) %s,\n\nSu pago de %.2f USD para la cita con el Dr. %s ha sido ANULADO.\n\nReferencia de pago: %s",
-                                                    cita.getNombrePaciente(), pagoActualizado.getMonto(), cita.getNombreMedico(), pagoActualizado.getReferencia());
+            // 2. Obtener la información de la cita para la notificación
+            CitaDTO cita = null;
+            try {
+                cita = citaClient.getCitaById(pagoActualizado.getCitaId());
+            } catch (FeignException e) {
+                System.err.println("ADVERTENCIA: No se pudo obtener la cita para el pago " + id + " al actualizar. Notificación podría ser incompleta. Error: " + e.getMessage());
+                // Podrías lanzar una excepción o manejarlo de otra forma si la cita es crítica
+            }
 
-                    NotificacionDTO notificacion = new NotificacionDTO(
-                        cita.getPacienteId(),
-                        "PAGO_ANULADO",
-                        asunto,
-                        mensaje,
-                        "EMAIL",
-                        "PagoService:" + pagoActualizado.getId()
-                    );
-                    notificacionesFeignClient.enviarNotificacion(notificacion);
-                    System.out.println("DEBUG: Notificación de pago anulado enviada exitosamente.");
-                } catch (FeignException e) {
-                    System.err.println("ERROR Feign al enviar notificación de pago anulado: " + e.status() + " - " + e.getMessage());
-                    e.printStackTrace();
-                } catch (Exception e) {
-                    System.err.println("ERROR GENERAL al intentar enviar notificación de pago anulado: " + e.getMessage());
-                    e.printStackTrace();
+            // 3. Lógica para enviar notificaciones basada en el CAMBIO de estado
+            if (!pagoActualizado.getEstado().equalsIgnoreCase(estadoPrevio)) { // Solo si el estado ha cambiado
+                if ("COMPLETADO".equals(pagoActualizado.getEstado())) {
+                    enviarNotificacionPago(pagoActualizado, "COMPLETADO", cita);
+                } else if ("ANULADO".equals(pagoActualizado.getEstado())) {
+                    enviarNotificacionPago(pagoActualizado, "ANULADO", cita);
                 }
+                // Podrías añadir más condiciones aquí para otros cambios de estado
+            } else {
+                System.out.println("DEBUG: El estado del pago ID " + id + " no cambió (" + estadoPrevio + " -> " + pagoActualizado.getEstado() + "), no se envía notificación.");
             }
         }
         return pagoActualizado;
@@ -175,6 +148,64 @@ public class PagoService {
             System.err.println("Error de comunicación con Citas al enriquecer pago " + pago.getId() + " para cita " + pago.getCitaId() + ": " + e.getMessage());
             pago.setNombrePaciente("Error de comunicación");
             pago.setNombreMedico("Error de comunicación");
+        }
+    }
+
+    /**
+     * Método auxiliar para enviar notificaciones de pago.
+     * @param pago El PagoDTO que disparó la notificación.
+     * @param tipoNotificacion El tipo de notificación (e.g., "COMPLETADO", "ANULADO").
+     * @param cita La CitaDTO asociada al pago (puede ser null si no se pudo obtener).
+     */
+    private void enviarNotificacionPago(PagoDTO pago, String tipoNotificacion, CitaDTO cita) {
+        System.out.println("DEBUG: El pago está " + tipoNotificacion + ", intentando enviar notificación.");
+        try {
+            String asunto = "";
+            String mensaje = "";
+            String eventType = "";
+
+            if ("COMPLETADO".equals(tipoNotificacion)) {
+                asunto = "Confirmación de Pago Completado para su Cita";
+                mensaje = String.format("Estimado(a) %s,\n\nSu pago de %.2f USD para la cita con el Dr. %s ha sido completado exitosamente.\n\nReferencia de pago: %s",
+                                         cita != null ? cita.getNombrePaciente() : "Paciente", pago.getMonto(), cita != null ? cita.getNombreMedico() : "Médico", pago.getReferencia());
+                eventType = "PAGO_COMPLETADO";
+            } else if ("ANULADO".equals(tipoNotificacion)) {
+                asunto = "Notificación de Pago Anulado";
+                mensaje = String.format("Estimado(a) %s,\n\nSu pago de %.2f USD para la cita con el Dr. %s ha sido ANULADO.\n\nReferencia de pago: %s",
+                                         cita != null ? cita.getNombrePaciente() : "Paciente", pago.getMonto(), cita != null ? cita.getNombreMedico() : "Médico", pago.getReferencia());
+                eventType = "PAGO_ANULADO";
+            } else {
+                System.out.println("ADVERTENCIA: Tipo de notificación no soportado: " + tipoNotificacion);
+                return;
+            }
+
+            NotificacionDTO notificacion = new NotificacionDTO(
+                cita != null ? cita.getPacienteId() : null, // ID del paciente
+                eventType,
+                asunto,
+                mensaje,
+                "EMAIL",
+                "PagoService:" + pago.getId()
+            );
+
+            // Intentar obtener el email del paciente de la cita si está disponible
+            if (cita != null && cita.getEmailPaciente() != null && !cita.getEmailPaciente().isEmpty()) {
+                notificacion.setEmailDestinatario(cita.getEmailPaciente());
+            } else {
+                // Si no se tiene el email del paciente, usa el valor por defecto que manejará NotificacionesService
+                // o considera lanzar una excepción si el email es obligatorio.
+                System.err.println("ADVERTENCIA: No se pudo obtener el email del paciente para la cita ID " + pago.getCitaId() + ". Se enviará a 'nodisponible@example.com'.");
+                notificacion.setEmailDestinatario("nodisponible@example.com"); // NotificacionesService ya maneja esto
+            }
+
+            notificacionesFeignClient.enviarNotificacion(notificacion);
+            System.out.println("DEBUG: Notificación de pago enviada exitosamente a NotificacionesService para pago ID: " + pago.getId() + " (tipo: " + tipoNotificacion + ").");
+        } catch (FeignException e) {
+            System.err.println("ERROR Feign al enviar notificación de pago " + tipoNotificacion + " para ID " + pago.getId() + ": " + e.status() + " - " + e.getMessage());
+            e.printStackTrace();
+        } catch (Exception e) {
+            System.err.println("ERROR GENERAL al intentar enviar notificación de pago " + tipoNotificacion + " para ID " + pago.getId() + ": " + e.getMessage());
+            e.printStackTrace();
         }
     }
 }
